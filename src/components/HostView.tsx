@@ -100,25 +100,36 @@ export const HostView: React.FC<HostViewProps> = ({
     };
   }, [dataChannelState, onSendSync, videoRef]);
 
-  // When a video file is loaded, start capture and notify ready.
-  // Keyed on objectUrl (stable across the later metadata-load update to
-  // videoInfo) so this only ever fires once per genuinely new file --
-  // firing twice caused a second captureStream() call that could abort
-  // an in-flight video.play() with AbortError.
+  // Do not capture a newly selected file until the media element can actually
+  // produce frames. Capturing too early can create a WebRTC track that stays
+  // effectively frozen until the host repeatedly toggles play/pause.
   const capturedForUrlRef = useRef<string | null>(null);
   useEffect(() => {
-    if (videoInfo && capturedForUrlRef.current !== videoInfo.objectUrl) {
-      capturedForUrlRef.current = videoInfo.objectUrl;
+    const video = videoRef.current;
+    if (!video || !videoInfo) return;
+    if (capturedForUrlRef.current === videoInfo.objectUrl) return;
+
+    const attachWhenReady = () => {
+      if (capturedForUrlRef.current === videoInfo.objectUrl) return;
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+
       const stream = startCapture();
-      if (stream) {
-        onAttachStream(stream);
-        // The signaling room may have just been created; the callback is
-        // intentionally kept separate from capture so the current room/token
-        // are used by the hook.
-        onSendHostReady();
-      }
+      if (!stream) return;
+      capturedForUrlRef.current = videoInfo.objectUrl;
+      onAttachStream(stream);
+      onSendHostReady();
+    };
+
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      attachWhenReady();
     }
-  }, [videoInfo, startCapture, onAttachStream, onSendHostReady]);
+    video.addEventListener('loadeddata', attachWhenReady);
+    video.addEventListener('canplay', attachWhenReady);
+    return () => {
+      video.removeEventListener('loadeddata', attachWhenReady);
+      video.removeEventListener('canplay', attachWhenReady);
+    };
+  }, [videoInfo?.objectUrl, startCapture, onAttachStream, onSendHostReady, videoRef]);
 
   // When a viewer joins, start WebRTC negotiation
   useEffect(() => {
@@ -331,6 +342,11 @@ export const HostView: React.FC<HostViewProps> = ({
                 }}
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
+                onWaiting={() => setIsPlaying(false)}
+                onEnded={() => {
+                  setIsPlaying(false);
+                  if (videoRef.current) onSendPause(videoRef.current.currentTime);
+                }}
                 onClick={togglePlay}
                 className="w-full h-full object-contain cursor-pointer"
               />
