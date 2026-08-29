@@ -33,7 +33,7 @@ export default function App() {
 
   // Synchronization callbacks for Viewer
   const handleRemotePlay = useCallback((time: number) => {
-    const video = document.querySelector('video') as HTMLVideoElement | null;
+    const video = viewerVideoElementRef.current;
     if (video) {
       if (Math.abs(video.currentTime - time) > 0.5) {
         try {
@@ -45,7 +45,7 @@ export default function App() {
   }, []);
 
   const handleRemotePause = useCallback((time: number) => {
-    const video = document.querySelector('video') as HTMLVideoElement | null;
+    const video = viewerVideoElementRef.current;
     if (video) {
       video.pause();
       if (Math.abs(video.currentTime - time) > 0.5) {
@@ -57,7 +57,7 @@ export default function App() {
   }, []);
 
   const handleRemoteSeek = useCallback((time: number) => {
-    const video = document.querySelector('video') as HTMLVideoElement | null;
+    const video = viewerVideoElementRef.current;
     if (video) {
       try {
         video.currentTime = time;
@@ -66,14 +66,14 @@ export default function App() {
   }, []);
 
   const handleRemoteRate = useCallback((rate: number, time: number) => {
-    const video = document.querySelector('video') as HTMLVideoElement | null;
+    const video = viewerVideoElementRef.current;
     if (video) {
       video.playbackRate = rate;
     }
   }, []);
 
   const handleRemoteSync = useCallback((sync: DCSyncMessage, expectedTime: number) => {
-    const video = document.querySelector('video') as HTMLVideoElement | null;
+    const video = viewerVideoElementRef.current;
     if (!video) return;
 
     // Use the same drift policy as SyncManager so the diagnostics and the
@@ -244,6 +244,7 @@ export default function App() {
             chatMessages={chatMessages}
             syncManager={syncManager}
             onSendMessage={sendChat}
+            onVideoElementReady={(video) => { viewerVideoElementRef.current = video; }}
           />
         )}
       </main>
