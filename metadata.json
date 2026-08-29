@@ -1,0 +1,6 @@
+{
+  "name": "WatchTogether — Private P2P Movie Watching",
+  "description": "Private, browser-to-browser peer-to-peer movie watching with real-time video streaming, host-authoritative playback synchronization, and encrypted data channel chat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
