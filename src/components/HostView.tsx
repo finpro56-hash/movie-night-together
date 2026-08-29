@@ -74,6 +74,9 @@ export const HostView: React.FC<HostViewProps> = ({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const syncTimerRef = useRef<number | null>(null);
+  const playbackIntentRef = useRef<'playing' | 'paused'>('paused');
+  const userPauseActionRef = useRef(false);
+  const recoveringPlaybackRef = useRef(false);
 
   const watchUrl = `${window.location.origin}/watch/${roomId}`;
 
@@ -82,7 +85,7 @@ export const HostView: React.FC<HostViewProps> = ({
     if (dataChannelState === 'open') {
       syncTimerRef.current = window.setInterval(() => {
         if (videoRef.current) {
-          const state = videoRef.current.paused ? 'paused' : 'playing';
+          const state = playbackIntentRef.current;
           onSendSync(
             state,
             videoRef.current.currentTime,
@@ -143,14 +146,22 @@ export const HostView: React.FC<HostViewProps> = ({
     if (!video) return;
 
     if (video.paused) {
+      recoveringPlaybackRef.current = false;
+      playbackIntentRef.current = 'playing';
       video.play().then(() => {
         setIsPlaying(true);
         onSendPlay(video.currentTime);
-      }).catch((e) => console.error('Local play error:', e));
+      }).catch((e) => {
+        playbackIntentRef.current = 'paused';
+        console.error('Local play error:', e);
+      });
     } else {
+      userPauseActionRef.current = true;
+      playbackIntentRef.current = 'paused';
       video.pause();
       setIsPlaying(false);
       onSendPause(video.currentTime);
+      window.setTimeout(() => { userPauseActionRef.current = false; }, 250);
     }
   }, [videoRef, onSendPlay, onSendPause]);
 
@@ -340,10 +351,39 @@ export const HostView: React.FC<HostViewProps> = ({
                     setDuration(videoRef.current.duration || 0);
                   }
                 }}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
-                onWaiting={() => setIsPlaying(false)}
+                onPlay={() => {
+                  setIsPlaying(true);
+                  if (!userPauseActionRef.current) playbackIntentRef.current = 'playing';
+                }}
+                onPause={() => {
+                  setIsPlaying(false);
+                  // A temporary media stall can emit pause/waiting events. Do not
+                  // broadcast that as an intentional pause; keep the shared
+                  // playback intent as playing and let the browser resume.
+                  if (userPauseActionRef.current || videoRef.current?.ended) {
+                    playbackIntentRef.current = 'paused';
+                  } else if (playbackIntentRef.current === 'playing') {
+                    recoveringPlaybackRef.current = true;
+                    window.setTimeout(() => {
+                      const v = videoRef.current;
+                      if (v && recoveringPlaybackRef.current && v.paused && !v.ended) {
+                        v.play().catch(() => {});
+                      }
+                    }, 300);
+                  }
+                }}
+                onWaiting={() => {
+                  // Waiting/buffering is not the same as a Host pause.
+                  setIsPlaying(true);
+                }}
+                onPlaying={() => {
+                  recoveringPlaybackRef.current = false;
+                  setIsPlaying(true);
+                  playbackIntentRef.current = 'playing';
+                }}
                 onEnded={() => {
+                  recoveringPlaybackRef.current = false;
+                  playbackIntentRef.current = 'paused';
                   setIsPlaying(false);
                   if (videoRef.current) onSendPause(videoRef.current.currentTime);
                 }}
