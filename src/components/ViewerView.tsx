@@ -25,6 +25,7 @@ interface ViewerViewProps {
   chatMessages: DCChatMessage[];
   syncManager: SyncManager;
   onSendMessage: (text: string) => boolean;
+  onVideoElementReady?: (video: HTMLVideoElement | null) => void;
 }
 
 export const ViewerView: React.FC<ViewerViewProps> = ({
@@ -35,6 +36,7 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
   chatMessages,
   syncManager,
   onSendMessage,
+  onVideoElementReady,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -43,41 +45,57 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
   const [isAutoplayBlocked, setIsAutoplayBlocked] = useState(false);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [driftInfo, setDriftInfo] = useState<{ driftMs: number; status: 'in-sync' | 'adjusting' | 'diverged' }>({
     driftMs: 0,
     status: 'in-sync',
   });
 
-  // Attach remote stream to HTMLVideoElement
+  // Register the exact viewer element so synchronization never accidentally
+  // targets the host video element. Then attach the remote WebRTC stream and
+  // wait for actual media readiness before attempting playback.
+  useEffect(() => {
+    const video = videoRef.current;
+    onVideoElementReady?.(video);
+    return () => onVideoElementReady?.(null);
+  }, [onVideoElementReady]);
+
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    if (remoteStream && remoteStream.getTracks().length > 0) {
-      console.log('[Viewer] Binding remote MediaStream to video element');
-      video.srcObject = remoteStream;
-
-      const playPromise = video.play();
-      if (playPromise !== undefined) {
-        playPromise
-          .then(() => {
-            setIsPlaying(true);
-            setIsAutoplayBlocked(false);
-          })
-          .catch((err) => {
-            console.warn('[Viewer] Autoplay blocked by browser policy:', err);
-            setIsAutoplayBlocked(true);
-          });
-      }
-    } else {
+    setPlaybackError(null);
+    if (!remoteStream || remoteStream.getTracks().length === 0) {
       video.srcObject = null;
+      setIsPlaying(false);
+      return;
     }
 
+    console.log('[Viewer] Binding remote MediaStream to video element');
+    video.srcObject = remoteStream;
+
+    const tryAutoplay = () => {
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+      video.play().then(() => {
+        setIsPlaying(true);
+        setIsAutoplayBlocked(false);
+      }).catch((err) => {
+        console.warn('[Viewer] Autoplay requires user gesture:', err);
+        setIsAutoplayBlocked(true);
+      });
+    };
+
+    video.addEventListener('loadedmetadata', tryAutoplay);
+    video.addEventListener('canplay', tryAutoplay);
+    video.addEventListener('loadeddata', tryAutoplay);
+    tryAutoplay();
+
     return () => {
-      if (video.srcObject === remoteStream) {
-        video.srcObject = null;
-      }
+      video.removeEventListener('loadedmetadata', tryAutoplay);
+      video.removeEventListener('canplay', tryAutoplay);
+      video.removeEventListener('loadeddata', tryAutoplay);
+      if (video.srcObject === remoteStream) video.srcObject = null;
     };
   }, [remoteStream]);
 
@@ -98,27 +116,36 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
     return () => clearInterval(timer);
   }, [syncManager]);
 
-  const handleStartWatchingGesture = () => {
+  const handleStartWatchingGesture = async () => {
     const video = videoRef.current;
     if (!video) return;
 
+    setPlaybackError(null);
     video.muted = false;
-    video
-      .play()
-      .then(() => {
-        setIsPlaying(true);
-        setIsAutoplayBlocked(false);
-      })
-      .catch((e) => {
-        console.error('[Viewer] Manual play failed:', e);
-        // Fallback: try muted
-        video.muted = true;
-        video.play().then(() => {
-          setIsPlaying(true);
-          setIsAutoplayBlocked(false);
-          setIsMuted(true);
+    try {
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        await new Promise<void>((resolve, reject) => {
+          const onReady = () => { cleanup(); resolve(); };
+          const onError = () => { cleanup(); reject(new Error('Remote video is not ready')); };
+          const cleanup = () => {
+            video.removeEventListener('canplay', onReady);
+            video.removeEventListener('loadeddata', onReady);
+            video.removeEventListener('error', onError);
+          };
+          video.addEventListener('canplay', onReady, { once: true });
+          video.addEventListener('loadeddata', onReady, { once: true });
+          video.addEventListener('error', onError, { once: true });
         });
-      });
+      }
+      await video.play();
+      setIsPlaying(true);
+      setIsAutoplayBlocked(false);
+      setIsMuted(video.muted);
+    } catch (e) {
+      console.error('[Viewer] Manual play failed:', e);
+      setIsAutoplayBlocked(true);
+      setPlaybackError('The remote video is not ready yet. Keep this page open for a moment and try START WATCHING again.');
+    }
   };
 
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -240,6 +267,9 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
                   <p className="text-xs text-slate-400 max-w-xs">
                     Browser security requires a click to enable synchronized video and audio playback.
                   </p>
+                  {playbackError && (
+                    <p className="text-xs text-rose-400 max-w-sm">{playbackError}</p>
+                  )}
                 </div>
                 <button
                   id="start-watching-btn"
