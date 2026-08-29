@@ -33,6 +33,18 @@ export function useLocalVideo(): UseLocalVideoReturn {
   const [isCaptureSupported, setIsCaptureSupported] = useState<boolean>(true);
   const [isVideoReady, setIsVideoReady] = useState<boolean>(false);
 
+  const activeObjectUrlRef = useRef<string | null>(null);
+  const activeStreamRef = useRef<MediaStream | null>(null);
+
+  // Keep refs in sync for safe unmount cleanup
+  useEffect(() => {
+    activeObjectUrlRef.current = videoInfo?.objectUrl || null;
+  }, [videoInfo?.objectUrl]);
+
+  useEffect(() => {
+    activeStreamRef.current = capturedStream;
+  }, [capturedStream]);
+
   // Check captureStream support on mount
   useEffect(() => {
     const video = document.createElement('video');
@@ -43,13 +55,15 @@ export function useLocalVideo(): UseLocalVideoReturn {
   }, []);
 
   const clearVideo = useCallback(() => {
-    if (videoInfo?.objectUrl) {
-      URL.revokeObjectURL(videoInfo.objectUrl);
+    if (activeObjectUrlRef.current) {
+      URL.revokeObjectURL(activeObjectUrlRef.current);
+      activeObjectUrlRef.current = null;
     }
-    if (capturedStream) {
-      capturedStream.getTracks().forEach((t) => t.stop());
-      setCapturedStream(null);
+    if (activeStreamRef.current) {
+      activeStreamRef.current.getTracks().forEach((t) => t.stop());
+      activeStreamRef.current = null;
     }
+    setCapturedStream(null);
     setVideoInfo(null);
     setIsVideoReady(false);
     setError(null);
@@ -57,19 +71,19 @@ export function useLocalVideo(): UseLocalVideoReturn {
       videoRef.current.src = '';
       videoRef.current.load();
     }
-  }, [videoInfo, capturedStream]);
+  }, []);
 
-  // Clean up object URLs on unmount
+  // Clean up object URLs and stream tracks ONLY on unmount
   useEffect(() => {
     return () => {
-      if (videoInfo?.objectUrl) {
-        URL.revokeObjectURL(videoInfo.objectUrl);
+      if (activeObjectUrlRef.current) {
+        URL.revokeObjectURL(activeObjectUrlRef.current);
       }
-      if (capturedStream) {
-        capturedStream.getTracks().forEach((t) => t.stop());
+      if (activeStreamRef.current) {
+        activeStreamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [videoInfo, capturedStream]);
+  }, []);
 
   const handleFileSelect = useCallback((file: File) => {
     setError(null);
@@ -80,12 +94,15 @@ export function useLocalVideo(): UseLocalVideoReturn {
       return;
     }
 
-    if (videoInfo?.objectUrl) {
-      URL.revokeObjectURL(videoInfo.objectUrl);
+    if (activeObjectUrlRef.current) {
+      URL.revokeObjectURL(activeObjectUrlRef.current);
+      activeObjectUrlRef.current = null;
     }
 
     try {
       const url = URL.createObjectURL(file);
+      activeObjectUrlRef.current = url;
+
       const info: LocalVideoInfo = {
         file,
         fileName: file.name,
@@ -99,29 +116,17 @@ export function useLocalVideo(): UseLocalVideoReturn {
       };
 
       setVideoInfo(info);
-      // NOTE: we intentionally do NOT touch videoRef.current here. At this
-      // point in the very first file selection, the <video> element hasn't
-      // been mounted yet (it's behind `!videoInfo ? dropzone : <video/>`),
-      // so videoRef.current would be null and this would silently no-op --
-      // wiring .src/.onloadedmetadata is done in the effect below instead,
-      // which runs after React has committed the real <video> element.
     } catch (err: any) {
       setError(`Failed to open local file: ${err?.message || 'Unknown error'}`);
     }
-  }, [videoInfo]);
+  }, []);
 
-  // Wires the actual <video> element to the selected file. Runs after
-  // React has mounted the <video> tag (guaranteed once videoInfo is set),
-  // rather than inline in handleFileSelect where the element may not exist
-  // yet on the very first file selection.
+  // Wires the actual <video> element to the selected file once per object URL
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !videoInfo?.objectUrl) return;
 
     setIsVideoReady(false);
-    video.pause();
-    video.removeAttribute('src');
-    video.load();
     video.src = videoInfo.objectUrl;
     video.load();
 
@@ -136,12 +141,19 @@ export function useLocalVideo(): UseLocalVideoReturn {
         Number(media.webkitAudioDecodedByteCount || 0) > 0;
       setVideoInfo((prev) => (prev ? { ...prev, duration, videoWidth, videoHeight, hasAudio } : null));
     };
+
+    let isMarkedReady = false;
     const markReady = () => {
+      if (isMarkedReady) return;
+      isMarkedReady = true;
       updateMetadata();
       setIsVideoReady(true);
     };
 
-    video.onloadedmetadata = updateMetadata;
+    video.onloadedmetadata = () => {
+      updateMetadata();
+      setIsVideoReady(true);
+    };
     video.oncanplay = markReady;
     video.onloadeddata = markReady;
     video.onerror = () => {
@@ -150,9 +162,16 @@ export function useLocalVideo(): UseLocalVideoReturn {
         'This browser cannot play this video format. Please select an H.264/AAC MP4 or WebM video file.'
       );
     };
-    // Keyed only on objectUrl (stable across the metadata-triggered
-    // videoInfo update above) so this runs exactly once per genuinely new
-    // file, not on every field change to videoInfo.
+
+    return () => {
+      if (video) {
+        video.onloadedmetadata = null;
+        video.oncanplay = null;
+        video.onloadeddata = null;
+        video.onerror = null;
+      }
+    };
+    // Keyed only on objectUrl so this runs exactly once per selected file
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoInfo?.objectUrl]);
 
@@ -162,12 +181,16 @@ export function useLocalVideo(): UseLocalVideoReturn {
       setError('Video player element not initialized');
       return null;
     }
-    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
       setError('Video is still loading. Please wait until the video is ready.');
       return null;
     }
 
     try {
+      if (activeStreamRef.current && activeStreamRef.current.active && activeStreamRef.current.getTracks().some((t) => t.readyState === 'live')) {
+        return activeStreamRef.current;
+      }
+
       let stream: MediaStream | null = null;
       if (typeof (video as any).captureStream === 'function') {
         stream = (video as any).captureStream();
@@ -182,6 +205,7 @@ export function useLocalVideo(): UseLocalVideoReturn {
         return null;
       }
 
+      activeStreamRef.current = stream;
       setCapturedStream(stream);
       return stream;
     } catch (err: any) {
@@ -192,11 +216,12 @@ export function useLocalVideo(): UseLocalVideoReturn {
   }, []);
 
   const stopCapture = useCallback(() => {
-    if (capturedStream) {
-      capturedStream.getTracks().forEach((t) => t.stop());
-      setCapturedStream(null);
+    if (activeStreamRef.current) {
+      activeStreamRef.current.getTracks().forEach((t) => t.stop());
+      activeStreamRef.current = null;
     }
-  }, [capturedStream]);
+    setCapturedStream(null);
+  }, []);
 
   return {
     videoRef,
