@@ -204,7 +204,42 @@ export class RoomManager {
   }
 
   /**
-   * Handles peer disconnection
+   * Handles an intentional room departure immediately.
+   */
+  public handleExplicitLeave(ws: WebSocket): {
+    roomId: string;
+    role: Role;
+    otherPeerWs: WebSocket | null;
+  } | null {
+    const info = this.wsToRoom.get(ws);
+    if (!info) return null;
+    this.wsToRoom.delete(ws);
+    const { roomId, role } = info;
+    const room = this.getRoom(roomId);
+    if (!room) return { roomId, role, otherPeerWs: null };
+
+    let otherPeerWs: WebSocket | null = null;
+    if (role === 'host') {
+      if (room.host?.ws === ws) room.host = null;
+      room.hostReady = false;
+      otherPeerWs = room.viewer?.ws ?? null;
+    } else {
+      if (room.viewer?.ws === ws) room.viewer = null;
+      otherPeerWs = room.host?.ws ?? null;
+    }
+
+    if (!room.host && !room.viewer) {
+      this.destroyRoom(roomId);
+    } else {
+      this.scheduleRoomCleanup(roomId, role === 'host' ? 60000 : this.emptyRoomGraceMs);
+    }
+    return { roomId, role, otherPeerWs };
+  }
+
+  /**
+   * Handles an unexpected signaling socket loss. Keep the room/peer slot alive
+   * briefly so a browser reconnect can replace the stale socket without
+   * destroying the active WebRTC session.
    */
   public handleDisconnect(ws: WebSocket): {
     roomId: string;
@@ -218,46 +253,23 @@ export class RoomManager {
     this.wsToRoom.delete(ws);
     const { roomId, role } = info;
     const room = this.getRoom(roomId);
+    if (!room) return { roomId, role, otherPeerWs: null, roomDestroyed: true };
 
-    if (!room) {
-      return { roomId, role, otherPeerWs: null, roomDestroyed: true };
-    }
-
-    let otherPeerWs: WebSocket | null = null;
-
+    // Do NOT immediately clear the peer or notify the other side. A short
+    // network/Wi-Fi interruption should be recoverable by REJOIN_ROOM.
     if (role === 'host') {
       if (room.host?.ws === ws) {
         room.host = null;
         room.hostReady = false;
       }
-      otherPeerWs = room.viewer?.ws ?? null;
-
-      // When Host disconnects, close room after short grace or immediately if viewer absent
-      if (!room.viewer) {
-        this.destroyRoom(roomId);
-        return { roomId, role, otherPeerWs: null, roomDestroyed: true };
-      } else {
-        // Schedule cleanup if host does not reconnect
-        this.scheduleRoomCleanup(roomId, 60000); // 1 minute
-      }
+      this.scheduleRoomCleanup(roomId, 5 * 60 * 1000);
     } else {
-      // Viewer left
-      if (room.viewer?.ws === ws) {
-        room.viewer = null;
-      }
-      otherPeerWs = room.host?.ws ?? null;
-
-      // If host is absent too, destroy. Otherwise keep the room briefly so
-      // the host can invite another viewer without leaving stale rooms forever.
-      if (!room.host) {
-        this.destroyRoom(roomId);
-        return { roomId, role, otherPeerWs: null, roomDestroyed: true };
-      }
+      if (room.viewer?.ws === ws) room.viewer = null;
       this.scheduleRoomCleanup(roomId, this.emptyRoomGraceMs);
     }
 
     room.lastActivityAt = Date.now();
-    return { roomId, role, otherPeerWs, roomDestroyed: false };
+    return { roomId, role, otherPeerWs: null, roomDestroyed: false };
   }
 
   /**
