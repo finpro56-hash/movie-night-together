@@ -148,8 +148,11 @@ export function setupWebSocketServer(httpServer: HTTPServer, roomManager: RoomMa
               sendJson(room.host.ws, { type: 'VIEWER_JOINED', payload: { roomId: room.id } });
             }
           } else if (room.viewer?.ws) {
+            // Host reconnected while the viewer stayed in the room. Notify the
+            // host too so it starts a fresh offer/ICE negotiation.
             sendJson(room.viewer.ws, { type: 'VIEWER_JOINED', payload: { roomId: room.id } });
             sendJson(ws, { type: 'HOST_READY', payload: { roomId: room.id } });
+            sendJson(ws, { type: 'VIEWER_JOINED', payload: { roomId: room.id } });
           }
           break;
         }
@@ -297,7 +300,7 @@ export function setupWebSocketServer(httpServer: HTTPServer, roomManager: RoomMa
         }
 
         case 'PEER_LEFT': {
-          const result = roomManager.handleDisconnect(ws);
+          const result = roomManager.handleExplicitLeave(ws);
           if (result && result.otherPeerWs) {
             const leftMsg: PeerLeftMessage = {
               type: 'PEER_LEFT',
@@ -327,18 +330,10 @@ export function setupWebSocketServer(httpServer: HTTPServer, roomManager: RoomMa
     });
 
     ws.on('close', () => {
-      const result = roomManager.handleDisconnect(ws);
-      if (result && result.otherPeerWs) {
-        const leftMsg: PeerLeftMessage = {
-          type: 'PEER_LEFT',
-          payload: {
-            roomId: result.roomId,
-            role: result.role,
-            reason: `${result.role === 'host' ? 'Host' : 'Viewer'} disconnected`,
-          },
-        };
-        sendJson(result.otherPeerWs, leftMsg);
-      }
+      // Unexpected signaling loss is recoverable. RoomManager keeps the room
+      // alive briefly and the client reconnects with REJOIN_ROOM. Do not tell
+      // the other peer that the user actually left.
+      roomManager.handleDisconnect(ws);
     });
 
     ws.on('error', (err) => {
