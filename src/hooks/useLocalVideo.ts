@@ -16,6 +16,7 @@ export interface UseLocalVideoReturn {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   videoInfo: LocalVideoInfo | null;
   isCaptureSupported: boolean;
+  isVideoReady: boolean;
   capturedStream: MediaStream | null;
   error: string | null;
   handleFileSelect: (file: File) => void;
@@ -30,6 +31,7 @@ export function useLocalVideo(): UseLocalVideoReturn {
   const [capturedStream, setCapturedStream] = useState<MediaStream | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isCaptureSupported, setIsCaptureSupported] = useState<boolean>(true);
+  const [isVideoReady, setIsVideoReady] = useState<boolean>(false);
 
   // Check captureStream support on mount
   useEffect(() => {
@@ -49,6 +51,7 @@ export function useLocalVideo(): UseLocalVideoReturn {
       setCapturedStream(null);
     }
     setVideoInfo(null);
+    setIsVideoReady(false);
     setError(null);
     if (videoRef.current) {
       videoRef.current.src = '';
@@ -115,25 +118,34 @@ export function useLocalVideo(): UseLocalVideoReturn {
     const video = videoRef.current;
     if (!video || !videoInfo?.objectUrl) return;
 
+    setIsVideoReady(false);
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
     video.src = videoInfo.objectUrl;
+    video.load();
 
-    video.onloadedmetadata = () => {
+    const updateMetadata = () => {
       if (!videoRef.current) return;
       const duration = videoRef.current.duration || 0;
       const videoWidth = videoRef.current.videoWidth || 0;
       const videoHeight = videoRef.current.videoHeight || 0;
-
-      // Audio-track detection is browser dependent. Never claim audio exists
-      // merely because the metadata event fired.
       const media = videoRef.current as any;
       const hasAudio = media.mozHasAudio === true ||
         Boolean(media.audioTracks?.length) ||
         Number(media.webkitAudioDecodedByteCount || 0) > 0;
-
       setVideoInfo((prev) => (prev ? { ...prev, duration, videoWidth, videoHeight, hasAudio } : null));
     };
+    const markReady = () => {
+      updateMetadata();
+      setIsVideoReady(true);
+    };
 
+    video.onloadedmetadata = updateMetadata;
+    video.oncanplay = markReady;
+    video.onloadeddata = markReady;
     video.onerror = () => {
+      setIsVideoReady(false);
       setError(
         'This browser cannot play this video format. Please select an H.264/AAC MP4 or WebM video file.'
       );
@@ -148,6 +160,10 @@ export function useLocalVideo(): UseLocalVideoReturn {
     const video = videoRef.current;
     if (!video) {
       setError('Video player element not initialized');
+      return null;
+    }
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      setError('Video is still loading. Please wait until the video is ready.');
       return null;
     }
 
@@ -186,6 +202,7 @@ export function useLocalVideo(): UseLocalVideoReturn {
     videoRef,
     videoInfo,
     isCaptureSupported,
+    isVideoReady,
     capturedStream,
     error,
     handleFileSelect,
