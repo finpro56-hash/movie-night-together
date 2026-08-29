@@ -37,7 +37,7 @@ export default function App() {
     viewerPlaybackIntentRef.current = 'playing';
     const video = viewerVideoElementRef.current;
     if (video) {
-      if (Math.abs(video.currentTime - time) > 0.5) {
+      if (!video.srcObject && Math.abs(video.currentTime - time) > 0.5) {
         try {
           video.currentTime = time;
         } catch {}
@@ -51,7 +51,7 @@ export default function App() {
     const video = viewerVideoElementRef.current;
     if (video) {
       video.pause();
-      if (Math.abs(video.currentTime - time) > 0.5) {
+      if (!video.srcObject && Math.abs(video.currentTime - time) > 0.5) {
         try {
           video.currentTime = time;
         } catch {}
@@ -61,14 +61,14 @@ export default function App() {
 
   const handleRemoteSeek = useCallback((time: number) => {
     const video = viewerVideoElementRef.current;
-    if (video) {
+    if (video && !video.srcObject) {
       try {
         video.currentTime = time;
       } catch {}
     }
   }, []);
 
-  const handleRemoteRate = useCallback((rate: number, time: number) => {
+  const handleRemoteRate = useCallback((rate: number, _time: number) => {
     const video = viewerVideoElementRef.current;
     if (video) {
       video.playbackRate = rate;
@@ -81,21 +81,21 @@ export default function App() {
     const video = viewerVideoElementRef.current;
     if (!video) return;
 
-    // Use the same drift policy as SyncManager so the diagnostics and the
-    // actual player correction cannot disagree.
-    const evaluation = syncManager.evaluateDrift(video.currentTime, expectedTime);
-
-    if (evaluation.action === 'HARD_SYNC') {
-      try {
-        video.currentTime = expectedTime;
-      } catch {}
-      video.playbackRate = sync.playbackRate;
-    } else if (evaluation.action === 'GENTLE_SLOW_DOWN') {
-      video.playbackRate = Math.max(0.5, sync.playbackRate * 0.97);
-    } else if (evaluation.action === 'GENTLE_SPEED_UP') {
-      video.playbackRate = Math.min(2, sync.playbackRate * 1.03);
-    } else {
-      video.playbackRate = sync.playbackRate;
+    // Only apply time drift adjustments if playing a standalone media file, not a live WebRTC stream
+    if (!video.srcObject) {
+      const diff = expectedTime - video.currentTime;
+      if (Math.abs(diff) > 2) {
+        try {
+          video.currentTime = expectedTime;
+        } catch {}
+        video.playbackRate = sync.playbackRate;
+      } else if (diff > 0.25) {
+        video.playbackRate = Math.min(2, sync.playbackRate * 1.03);
+      } else if (diff < -0.25) {
+        video.playbackRate = Math.max(0.5, sync.playbackRate * 0.97);
+      } else {
+        video.playbackRate = sync.playbackRate;
+      }
     }
 
     if (sync.state === 'playing' && video.paused) {
