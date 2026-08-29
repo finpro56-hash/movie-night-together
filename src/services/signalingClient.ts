@@ -10,11 +10,14 @@ export type SignalingEventHandler<T = any> = (payload: T) => void;
 export class SignalingClient {
   private ws: WebSocket | null = null;
   private url: string;
-  private listeners: Map<SignalingMessageType | 'open' | 'close' | 'ws_error', Set<SignalingEventHandler>> = new Map();
+  private listeners: Map<SignalingMessageType | 'open' | 'reconnected' | 'close' | 'ws_error', Set<SignalingEventHandler>> = new Map();
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
+  private maxReconnectAttempts = 20;
+  private reconnectTimer?: number;
   private isExplicitlyClosed = false;
   private pingTimer?: number;
+  private hasConnectedBefore = false;
+  private connecting = false;
 
   constructor(customUrl?: string) {
     if (customUrl) {
@@ -26,8 +29,28 @@ export class SignalingClient {
   }
 
   public connect(): Promise<void> {
+    if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+    if (this.ws?.readyState === WebSocket.CONNECTING && this.connecting) {
+      return new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          cleanup();
+          reject(new Error('Signaling connection timed out'));
+        }, 10000);
+        const onOpen = () => { cleanup(); resolve(); };
+        const onClose = () => { cleanup(); reject(new Error('Signaling connection closed')); };
+        const cleanup = () => {
+          window.clearTimeout(timeout);
+          this.listeners.get('open')?.delete(onOpen);
+          this.listeners.get('close')?.delete(onClose);
+        };
+        this.on('open', onOpen);
+        this.on('close', onClose);
+      });
+    }
+
     return new Promise((resolve, reject) => {
       this.isExplicitlyClosed = false;
+      this.connecting = true;
 
       try {
         this.ws = new WebSocket(this.url);
@@ -36,9 +59,13 @@ export class SignalingClient {
       }
 
       this.ws.onopen = () => {
+        this.connecting = false;
+        const wasReconnected = this.hasConnectedBefore;
+        this.hasConnectedBefore = true;
         this.reconnectAttempts = 0;
         this.startHeartbeat();
         this.emit('open', {});
+        if (wasReconnected) this.emit('reconnected', {});
         resolve();
       };
 
@@ -54,15 +81,18 @@ export class SignalingClient {
       };
 
       this.ws.onclose = (event) => {
+        this.connecting = false;
         this.stopHeartbeat();
         this.emit('close', event);
 
         if (!this.isExplicitlyClosed && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.reconnectAttempts++;
-          const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts), 10000);
+          const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts - 1), 15000);
           console.warn(`[Signaling] Connection lost. Reconnecting attempt ${this.reconnectAttempts} in ${delay}ms...`);
-          setTimeout(() => {
-            if (!this.isExplicitlyClosed) {
+          if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = window.setTimeout(() => {
+            this.reconnectTimer = undefined;
+            if (!this.isExplicitlyClosed && !this.isConnected()) {
               this.connect().catch((e) => console.error('[Signaling] Reconnect failed:', e));
             }
           }, delay);
@@ -75,7 +105,7 @@ export class SignalingClient {
     });
   }
 
-  public on<T = any>(event: SignalingMessageType | 'open' | 'close' | 'ws_error', handler: SignalingEventHandler<T>): () => void {
+  public on<T = any>(event: SignalingMessageType | 'open' | 'reconnected' | 'close' | 'ws_error', handler: SignalingEventHandler<T>): () => void {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set());
     }
@@ -157,6 +187,10 @@ export class SignalingClient {
 
   public close(): void {
     this.isExplicitlyClosed = true;
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
     this.stopHeartbeat();
     if (this.ws) {
       this.ws.close();
