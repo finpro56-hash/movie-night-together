@@ -30,9 +30,11 @@ export default function App() {
 
   // Remote viewer video element ref for synchronization events
   const viewerVideoElementRef = useRef<HTMLVideoElement | null>(null);
+  const viewerPlaybackIntentRef = useRef<'playing' | 'paused'>('paused');
 
   // Synchronization callbacks for Viewer
   const handleRemotePlay = useCallback((time: number) => {
+    viewerPlaybackIntentRef.current = 'playing';
     const video = viewerVideoElementRef.current;
     if (video) {
       if (Math.abs(video.currentTime - time) > 0.5) {
@@ -45,6 +47,7 @@ export default function App() {
   }, []);
 
   const handleRemotePause = useCallback((time: number) => {
+    viewerPlaybackIntentRef.current = 'paused';
     const video = viewerVideoElementRef.current;
     if (video) {
       video.pause();
@@ -73,6 +76,8 @@ export default function App() {
   }, []);
 
   const handleRemoteSync = useCallback((sync: DCSyncMessage, expectedTime: number) => {
+    if (sync.state === 'playing') viewerPlaybackIntentRef.current = 'playing';
+    else if (sync.state === 'paused') viewerPlaybackIntentRef.current = 'paused';
     const video = viewerVideoElementRef.current;
     if (!video) return;
 
