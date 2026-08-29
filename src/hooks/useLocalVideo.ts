@@ -96,35 +96,53 @@ export function useLocalVideo(): UseLocalVideoReturn {
       };
 
       setVideoInfo(info);
-
-      if (videoRef.current) {
-        videoRef.current.src = url;
-        videoRef.current.onloadedmetadata = () => {
-          if (!videoRef.current) return;
-          const duration = videoRef.current.duration || 0;
-          const videoWidth = videoRef.current.videoWidth || 0;
-          const videoHeight = videoRef.current.videoHeight || 0;
-
-          // Audio-track detection is browser dependent. Never claim audio exists
-          // merely because the metadata event fired.
-          const media = videoRef.current as any;
-          const hasAudio = media.mozHasAudio === true ||
-            Boolean(media.audioTracks?.length) ||
-            Number(media.webkitAudioDecodedByteCount || 0) > 0;
-
-          setVideoInfo((prev) => (prev ? { ...prev, duration, videoWidth, videoHeight, hasAudio } : null));
-        };
-
-        videoRef.current.onerror = () => {
-          setError(
-            'This browser cannot play this video format. Please select an H.264/AAC MP4 or WebM video file.'
-          );
-        };
-      }
+      // NOTE: we intentionally do NOT touch videoRef.current here. At this
+      // point in the very first file selection, the <video> element hasn't
+      // been mounted yet (it's behind `!videoInfo ? dropzone : <video/>`),
+      // so videoRef.current would be null and this would silently no-op --
+      // wiring .src/.onloadedmetadata is done in the effect below instead,
+      // which runs after React has committed the real <video> element.
     } catch (err: any) {
       setError(`Failed to open local file: ${err?.message || 'Unknown error'}`);
     }
   }, [videoInfo]);
+
+  // Wires the actual <video> element to the selected file. Runs after
+  // React has mounted the <video> tag (guaranteed once videoInfo is set),
+  // rather than inline in handleFileSelect where the element may not exist
+  // yet on the very first file selection.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !videoInfo?.objectUrl) return;
+
+    video.src = videoInfo.objectUrl;
+
+    video.onloadedmetadata = () => {
+      if (!videoRef.current) return;
+      const duration = videoRef.current.duration || 0;
+      const videoWidth = videoRef.current.videoWidth || 0;
+      const videoHeight = videoRef.current.videoHeight || 0;
+
+      // Audio-track detection is browser dependent. Never claim audio exists
+      // merely because the metadata event fired.
+      const media = videoRef.current as any;
+      const hasAudio = media.mozHasAudio === true ||
+        Boolean(media.audioTracks?.length) ||
+        Number(media.webkitAudioDecodedByteCount || 0) > 0;
+
+      setVideoInfo((prev) => (prev ? { ...prev, duration, videoWidth, videoHeight, hasAudio } : null));
+    };
+
+    video.onerror = () => {
+      setError(
+        'This browser cannot play this video format. Please select an H.264/AAC MP4 or WebM video file.'
+      );
+    };
+    // Keyed only on objectUrl (stable across the metadata-triggered
+    // videoInfo update above) so this runs exactly once per genuinely new
+    // file, not on every field change to videoInfo.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoInfo?.objectUrl]);
 
   const startCapture = useCallback((): MediaStream | null => {
     const video = videoRef.current;
