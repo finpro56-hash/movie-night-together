@@ -100,9 +100,15 @@ export const HostView: React.FC<HostViewProps> = ({
     };
   }, [dataChannelState, onSendSync, videoRef]);
 
-  // When a video file is loaded, start capture and notify ready
+  // When a video file is loaded, start capture and notify ready.
+  // Keyed on objectUrl (stable across the later metadata-load update to
+  // videoInfo) so this only ever fires once per genuinely new file --
+  // firing twice caused a second captureStream() call that could abort
+  // an in-flight video.play() with AbortError.
+  const capturedForUrlRef = useRef<string | null>(null);
   useEffect(() => {
-    if (videoInfo) {
+    if (videoInfo && capturedForUrlRef.current !== videoInfo.objectUrl) {
+      capturedForUrlRef.current = videoInfo.objectUrl;
       const stream = startCapture();
       if (stream) {
         onAttachStream(stream);
