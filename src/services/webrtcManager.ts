@@ -32,6 +32,7 @@ export class WebRTCManager {
   private iceRestartInFlight = false;
   private iceRecoveryTimer?: number;
   private recoveryAttempts = 0;
+  private maxRecoveryAttempts = 12;
   private recoveryInFlight = false;
   private lastConnectedAt = 0;
 
@@ -131,10 +132,13 @@ export class WebRTCManager {
         this.callbacks.onConnectionStateChange('RECONNECTING');
         // ICE disconnected can recover by itself. Give it a few seconds before
         // forcing an ICE restart, which avoids needless renegotiation on jitter.
-        if (this.role === 'host' && !this.iceRecoveryTimer) {
+        if (!this.iceRecoveryTimer) {
           this.iceRecoveryTimer = window.setTimeout(() => {
             this.iceRecoveryTimer = undefined;
-            if (this.pc?.iceConnectionState === 'disconnected') void this.restartIce();
+            if (this.pc?.iceConnectionState === 'disconnected') {
+              if (this.role === 'host') void this.restartIce();
+              else void this.recoverConnection();
+            }
           }, 4000);
         }
       } else if (iceState === 'failed') {
@@ -292,7 +296,7 @@ export class WebRTCManager {
    * rebuilds only when its existing connection is no longer usable.
    */
   public async recoverConnection(): Promise<RTCSessionDescriptionInit | null> {
-    if (this.isClosed || this.recoveryAttempts >= 3 || this.recoveryInFlight) return null;
+    if (this.isClosed || this.recoveryAttempts >= this.maxRecoveryAttempts || this.recoveryInFlight) return null;
 
     this.recoveryInFlight = true;
     this.recoveryAttempts += 1;
