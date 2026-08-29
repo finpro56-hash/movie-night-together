@@ -77,6 +77,9 @@ export const HostView: React.FC<HostViewProps> = ({
   const playbackIntentRef = useRef<'playing' | 'paused'>('paused');
   const userPauseActionRef = useRef(false);
   const recoveringPlaybackRef = useRef(false);
+  const playPromiseRef = useRef<Promise<void> | null>(null);
+  const isSeekingRef = useRef(false);
+  const wasPlayingBeforeSeekRef = useRef(false);
 
   const watchUrl = `${window.location.origin}/watch/${roomId}`;
 
@@ -104,17 +107,16 @@ export const HostView: React.FC<HostViewProps> = ({
   }, [dataChannelState, onSendSync, videoRef]);
 
   // Do not capture a newly selected file until the media element can actually
-  // produce frames. Capturing too early can create a WebRTC track that stays
-  // effectively frozen until the host repeatedly toggles play/pause.
+  // produce frames. Runs exactly once per unique file objectUrl.
   const capturedForUrlRef = useRef<string | null>(null);
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !videoInfo) return;
+    if (!video || !videoInfo?.objectUrl) return;
     if (capturedForUrlRef.current === videoInfo.objectUrl) return;
 
-    const attachWhenReady = () => {
+    const doCapture = () => {
       if (capturedForUrlRef.current === videoInfo.objectUrl) return;
-      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+      if (!videoRef.current || videoRef.current.readyState < HTMLMediaElement.HAVE_METADATA) return;
 
       const stream = startCapture();
       if (!stream) return;
@@ -123,54 +125,105 @@ export const HostView: React.FC<HostViewProps> = ({
       onSendHostReady();
     };
 
-    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      attachWhenReady();
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      doCapture();
+    } else {
+      video.addEventListener('loadedmetadata', doCapture, { once: true });
+      video.addEventListener('canplay', doCapture, { once: true });
     }
-    video.addEventListener('loadeddata', attachWhenReady);
-    video.addEventListener('canplay', attachWhenReady);
-    return () => {
-      video.removeEventListener('loadeddata', attachWhenReady);
-      video.removeEventListener('canplay', attachWhenReady);
-    };
   }, [videoInfo?.objectUrl, startCapture, onAttachStream, onSendHostReady, videoRef]);
 
-  // When a viewer joins, start WebRTC negotiation
+  // When a viewer joins and we have a video loaded, initiate negotiation once
+  const negotiatedForViewerRef = useRef(false);
   useEffect(() => {
-    if (isViewerConnected && videoInfo) {
-      onStartNegotiation();
+    if (isViewerConnected && videoInfo?.objectUrl) {
+      if (!negotiatedForViewerRef.current) {
+        negotiatedForViewerRef.current = true;
+        onStartNegotiation();
+      }
+    } else if (!isViewerConnected) {
+      negotiatedForViewerRef.current = false;
     }
-  }, [isViewerConnected, videoInfo, onStartNegotiation]);
+  }, [isViewerConnected, videoInfo?.objectUrl, onStartNegotiation]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
 
     if (video.paused) {
+      userPauseActionRef.current = false;
       recoveringPlaybackRef.current = false;
       playbackIntentRef.current = 'playing';
-      video.play().then(() => {
+
+      const promise = video.play();
+      playPromiseRef.current = promise;
+
+      promise.then(() => {
         setIsPlaying(true);
         onSendPlay(video.currentTime);
-      }).catch((e) => {
-        playbackIntentRef.current = 'paused';
-        console.error('Local play error:', e);
+      }).catch((err: any) => {
+        // Ignore AbortError when play was cleanly interrupted by user pause or seek
+        if (err.name !== 'AbortError') {
+          console.error('Local play error:', err);
+        }
       });
     } else {
       userPauseActionRef.current = true;
       playbackIntentRef.current = 'paused';
-      video.pause();
       setIsPlaying(false);
       onSendPause(video.currentTime);
-      window.setTimeout(() => { userPauseActionRef.current = false; }, 250);
+
+      const doPause = () => {
+        video.pause();
+        window.setTimeout(() => { userPauseActionRef.current = false; }, 200);
+      };
+
+      if (playPromiseRef.current) {
+        playPromiseRef.current.then(doPause).catch(doPause);
+      } else {
+        doPause();
+      }
     }
   }, [videoRef, onSendPlay, onSendPause]);
+
+  const handleSeekStart = () => {
+    isSeekingRef.current = true;
+    if (videoRef.current && !videoRef.current.paused) {
+      wasPlayingBeforeSeekRef.current = true;
+    } else {
+      wasPlayingBeforeSeekRef.current = false;
+    }
+  };
 
   const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newTime = parseFloat(e.target.value);
     setCurrentTime(newTime);
     if (videoRef.current) {
       videoRef.current.currentTime = newTime;
-      onSendSeek(newTime);
+    }
+  };
+
+  const handleSeekEnd = () => {
+    isSeekingRef.current = false;
+    const video = videoRef.current;
+    if (!video) return;
+
+    const newTime = video.currentTime;
+    onSendSeek(newTime);
+
+    if (wasPlayingBeforeSeekRef.current && video.paused) {
+      userPauseActionRef.current = false;
+      playbackIntentRef.current = 'playing';
+      const promise = video.play();
+      playPromiseRef.current = promise;
+      promise.then(() => {
+        setIsPlaying(true);
+        onSendPlay(newTime);
+      }).catch((err: any) => {
+        if (err.name !== 'AbortError') {
+          console.error('Play error after seek:', err);
+        }
+      });
     }
   };
 
@@ -340,6 +393,7 @@ export const HostView: React.FC<HostViewProps> = ({
             >
               <video
                 ref={videoRef}
+                src={videoInfo.objectUrl}
                 playsInline
                 onTimeUpdate={() => {
                   if (videoRef.current) {
@@ -357,19 +411,16 @@ export const HostView: React.FC<HostViewProps> = ({
                 }}
                 onPause={() => {
                   setIsPlaying(false);
-                  // A temporary media stall can emit pause/waiting events. Do not
-                  // broadcast that as an intentional pause; keep the shared
-                  // playback intent as playing and let the browser resume.
                   if (userPauseActionRef.current || videoRef.current?.ended) {
                     playbackIntentRef.current = 'paused';
-                  } else if (playbackIntentRef.current === 'playing') {
-                    recoveringPlaybackRef.current = true;
-                    window.setTimeout(() => {
-                      const v = videoRef.current;
-                      if (v && recoveringPlaybackRef.current && v.paused && !v.ended) {
-                        v.play().catch(() => {});
-                      }
-                    }, 300);
+                  } else if (playbackIntentRef.current === 'playing' && !isSeekingRef.current) {
+                    // Temporary media buffer stall: keep playback intent as playing and resume cleanly
+                    const v = videoRef.current;
+                    if (v && v.paused && !v.ended && playbackIntentRef.current === 'playing') {
+                      const p = v.play();
+                      playPromiseRef.current = p;
+                      p.catch(() => {});
+                    }
                   }
                 }}
                 onWaiting={() => {
@@ -423,6 +474,11 @@ export const HostView: React.FC<HostViewProps> = ({
                     step={0.1}
                     value={currentTime}
                     onChange={handleSeekChange}
+                    onMouseDown={handleSeekStart}
+                    onTouchStart={handleSeekStart}
+                    onMouseUp={handleSeekEnd}
+                    onTouchEnd={handleSeekEnd}
+                    onKeyUp={handleSeekEnd}
                     className="flex-1 h-1.5 bg-slate-700/80 rounded-lg appearance-none cursor-pointer accent-orange-500 hover:h-2 transition-all"
                   />
                   <span className="text-xs font-mono text-slate-400 min-w-[45px]">
