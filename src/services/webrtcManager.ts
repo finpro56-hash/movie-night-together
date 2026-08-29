@@ -29,8 +29,11 @@ export class WebRTCManager {
   private isRemoteDescriptionSet = false;
   private isClosed = false;
   private localStream: MediaStream | null = null;
-  private reconnectTimer?: number;
   private iceRestartInFlight = false;
+  private iceRecoveryTimer?: number;
+  private recoveryAttempts = 0;
+  private recoveryInFlight = false;
+  private lastConnectedAt = 0;
 
   // Track previous stats to calculate bitrates
   private prevBytesReceived = 0;
@@ -115,15 +118,29 @@ export class WebRTCManager {
       console.log(`[WebRTC] ICE Connection State: ${iceState}`);
 
       if (iceState === 'connected' || iceState === 'completed') {
+        this.recoveryAttempts = 0;
+        this.lastConnectedAt = Date.now();
+        if (this.iceRecoveryTimer) {
+          window.clearTimeout(this.iceRecoveryTimer);
+          this.iceRecoveryTimer = undefined;
+        }
         this.callbacks.onConnectionStateChange('CONNECTED');
       } else if (iceState === 'checking') {
         this.callbacks.onConnectionStateChange('CONNECTING');
       } else if (iceState === 'disconnected') {
         this.callbacks.onConnectionStateChange('RECONNECTING');
+        // ICE disconnected can recover by itself. Give it a few seconds before
+        // forcing an ICE restart, which avoids needless renegotiation on jitter.
+        if (this.role === 'host' && !this.iceRecoveryTimer) {
+          this.iceRecoveryTimer = window.setTimeout(() => {
+            this.iceRecoveryTimer = undefined;
+            if (this.pc?.iceConnectionState === 'disconnected') void this.restartIce();
+          }, 4000);
+        }
       } else if (iceState === 'failed') {
         this.callbacks.onConnectionStateChange('RECONNECTING');
         this.callbacks.onError('ICE_FAILED', 'WebRTC ICE connection failed. Attempting ICE restart.');
-        void this.restartIce();
+        void this.recoverConnection();
       } else if (iceState === 'closed') {
         this.callbacks.onConnectionStateChange('CLOSED');
       }
@@ -135,6 +152,10 @@ export class WebRTCManager {
       console.log(`[WebRTC] Connection State: ${state}`);
 
       if (state === 'connected') {
+        if (this.iceRecoveryTimer) {
+          window.clearTimeout(this.iceRecoveryTimer);
+          this.iceRecoveryTimer = undefined;
+        }
         this.callbacks.onConnectionStateChange('CONNECTED');
       } else if (state === 'connecting') {
         this.callbacks.onConnectionStateChange('CONNECTING');
@@ -143,7 +164,7 @@ export class WebRTCManager {
       } else if (state === 'failed') {
         this.callbacks.onConnectionStateChange('RECONNECTING');
         this.callbacks.onError('WEBRTC_ERROR', 'Peer connection failed. Attempting recovery.');
-        void this.restartIce();
+        void this.recoverConnection();
       } else if (state === 'closed') {
         this.callbacks.onConnectionStateChange('CLOSED');
       }
@@ -248,7 +269,7 @@ export class WebRTCManager {
    */
   public async restartIce(): Promise<RTCSessionDescriptionInit | null> {
     if (this.role !== 'host' || !this.pc || this.iceRestartInFlight || this.isClosed) return null;
-    if (!this.pc.remoteDescription) return null;
+    if (!this.pc.remoteDescription || this.pc.signalingState !== 'stable') return null;
 
     this.iceRestartInFlight = true;
     try {
@@ -266,10 +287,56 @@ export class WebRTCManager {
   }
 
   /**
+   * Recover from a genuinely failed peer connection. The host rebuilds the
+   * connection and emits a fresh offer; the viewer waits for that offer and
+   * rebuilds only when its existing connection is no longer usable.
+   */
+  public async recoverConnection(): Promise<RTCSessionDescriptionInit | null> {
+    if (this.isClosed || this.recoveryAttempts >= 3 || this.recoveryInFlight) return null;
+
+    this.recoveryInFlight = true;
+    this.recoveryAttempts += 1;
+    this.callbacks.onConnectionStateChange('RECONNECTING');
+
+    if (this.role === 'host') {
+      const stream = this.localStream;
+      await this.initialize(undefined, true);
+      if (stream) this.addLocalStream(stream);
+      try {
+        const offer = await this.createOffer();
+        this.callbacks.onIceRestartOffer?.(offer);
+        return offer;
+      } catch (err) {
+        console.error('[WebRTC] Full host recovery failed:', err);
+        this.callbacks.onError('WEBRTC_ERROR', 'Unable to rebuild the WebRTC connection.');
+        return null;
+      } finally {
+        this.recoveryInFlight = false;
+      }
+    }
+
+    // Viewer cannot create the offer. Resetting here makes it ready to accept
+    // the host's fresh offer after signaling reconnects.
+    try {
+      await this.initialize(undefined, true);
+      return null;
+    } finally {
+      this.recoveryInFlight = false;
+    }
+  }
+
+  /**
    * Viewer: Handles SDP offer and creates SDP answer
    */
   public async handleOfferAndCreateAnswer(offerSdp: RTCSessionDescriptionInit): Promise<RTCSessionDescriptionInit> {
+    if (!this.pc) await this.initialize();
     if (!this.pc) throw new Error('RTCPeerConnection not initialized');
+
+    // A failed/closed viewer connection cannot reliably be reused. Build a
+    // clean receiver before applying the host's recovery offer.
+    if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed' || this.pc.iceConnectionState === 'failed') {
+      await this.initialize(undefined, true);
+    }
 
     this.callbacks.onConnectionStateChange('NEGOTIATING');
 
@@ -519,11 +586,6 @@ export class WebRTCManager {
   public close(clearLocalStream = true): void {
     this.isClosed = true;
     this.stopStatsPolling();
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = undefined;
-    }
-
     if (this.dataChannel) {
       try {
         this.dataChannel.close();
