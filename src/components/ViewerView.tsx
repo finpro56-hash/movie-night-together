@@ -46,6 +46,7 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const hostPlaybackIntentRef = useRef<'playing' | 'paused'>('paused');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [driftInfo, setDriftInfo] = useState<{ driftMs: number; status: 'in-sync' | 'adjusting' | 'diverged' }>({
     driftMs: 0,
@@ -77,6 +78,7 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
 
     const tryAutoplay = () => {
       if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+      if (hostPlaybackIntentRef.current !== 'playing') return;
       video.play().then(() => {
         setIsPlaying(true);
         setIsAutoplayBlocked(false);
@@ -138,6 +140,7 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
         });
       }
       await video.play();
+      hostPlaybackIntentRef.current = 'playing';
       setIsPlaying(true);
       setIsAutoplayBlocked(false);
       setIsMuted(video.muted);
@@ -147,6 +150,28 @@ export const ViewerView: React.FC<ViewerViewProps> = ({
       setPlaybackError('The remote video is not ready yet. Keep this page open for a moment and try START WATCHING again.');
     }
   };
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onPlaying = () => setIsPlaying(true);
+    const onWaiting = () => {
+      // Keep the UI in a watching state during a short network/media stall.
+      // Do not treat buffering as a host PAUSE command.
+      if (hostPlaybackIntentRef.current === 'playing') setIsPlaying(true);
+    };
+    const onStalled = () => {
+      if (hostPlaybackIntentRef.current === 'playing') setIsPlaying(true);
+    };
+    video.addEventListener('playing', onPlaying);
+    video.addEventListener('waiting', onWaiting);
+    video.addEventListener('stalled', onStalled);
+    return () => {
+      video.removeEventListener('playing', onPlaying);
+      video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('stalled', onStalled);
+    };
+  }, [remoteStream]);
 
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseFloat(e.target.value);
