@@ -73,6 +73,8 @@ export function useWebRTC(options: UseWebRTCOptions = {}): UseWebRTCReturn {
   const activeHostTokenRef = useRef<string | null>(hostToken);
   activeHostTokenRef.current = hostToken;
   const activeRoleRef = useRef<Role | null>(role);
+  const negotiationInFlightRef = useRef(false);
+  const recoveryRequestTimerRef = useRef<number>();
   activeRoleRef.current = role;
 
   const clearError = useCallback(() => {
@@ -126,7 +128,13 @@ export function useWebRTC(options: UseWebRTCOptions = {}): UseWebRTCReturn {
   useEffect(() => {
     const handleOnline = () => {
       if (activeRoleRef.current === 'host' && webrtcRef.current) {
-        void webrtcRef.current.restartIce();
+        void webrtcRef.current.recoverConnection();
+      } else if (activeRoleRef.current === 'viewer' && signalingRef.current && activeRoomIdRef.current) {
+        if (recoveryRequestTimerRef.current) window.clearTimeout(recoveryRequestTimerRef.current);
+        recoveryRequestTimerRef.current = window.setTimeout(() => {
+          recoveryRequestTimerRef.current = undefined;
+          signalingRef.current?.rejoinRoom(activeRoomIdRef.current!, 'viewer');
+        }, 500);
       }
     };
     window.addEventListener('online', handleOnline);
@@ -153,7 +161,17 @@ export function useWebRTC(options: UseWebRTCOptions = {}): UseWebRTCReturn {
     }
 
     const webrtc = new WebRTCManager(currentRole, {
-      onConnectionStateChange: (state) => setConnectionState(state),
+      onConnectionStateChange: (state) => {
+        setConnectionState(state);
+        if (state === 'RECONNECTING' || state === 'CONNECTING') setLastError(null);
+        if (state === 'RECONNECTING' && currentRole === 'viewer' && signalingRef.current && activeRoomIdRef.current) {
+          if (recoveryRequestTimerRef.current) window.clearTimeout(recoveryRequestTimerRef.current);
+          recoveryRequestTimerRef.current = window.setTimeout(() => {
+            recoveryRequestTimerRef.current = undefined;
+            signalingRef.current?.rejoinRoom(activeRoomIdRef.current!, 'viewer');
+          }, 500);
+        }
+      },
       onDataChannelStateChange: (dcState) => setDataChannelState(dcState),
       onDataChannelMessage: handleDataChannelMessage,
       onRemoteStream: (stream) => {
@@ -189,13 +207,17 @@ export function useWebRTC(options: UseWebRTCOptions = {}): UseWebRTCReturn {
     const sig = signalingRef.current;
 
     sig.on('open', () => {
+      // Initial connection only. Reconnects are handled by the dedicated
+      // 'reconnected' event so REJOIN_ROOM is sent exactly once.
+    });
+
+    sig.on('reconnected', async () => {
       const activeRoomId = activeRoomIdRef.current;
       const activeRole = activeRoleRef.current;
-      if (activeRoomId && activeRole) {
-        // A reconnect gets a fresh WebSocket. Re-associate it with the same
-        // ephemeral room instead of silently losing the session.
-        sig.rejoinRoom(activeRoomId, activeRole, activeHostTokenRef.current || undefined);
-      }
+      if (!activeRoomId || !activeRole) return;
+
+      setConnectionState('RECONNECTING');
+      sig.rejoinRoom(activeRoomId, activeRole, activeHostTokenRef.current || undefined);
     });
 
     sig.on('ROOM_CREATED', (payload: { roomId: string; hostToken: string }) => {
@@ -216,6 +238,25 @@ export function useWebRTC(options: UseWebRTCOptions = {}): UseWebRTCReturn {
     sig.on('VIEWER_JOINED', async () => {
       setIsViewerConnected(true);
       setConnectionState('CONNECTING');
+
+      // Every viewer join/rejoin is an opportunity to rebuild a stale WebRTC
+      // session. Only the host creates the offer, preventing offer glare.
+      if (activeRoleRef.current !== 'host' || negotiationInFlightRef.current) return;
+
+      negotiationInFlightRef.current = true;
+      try {
+        const webrtc = webrtcRef.current || initWebRTC('host');
+        await webrtc.initialize();
+        const offer = await webrtc.createOffer();
+        if (activeRoomIdRef.current) {
+          sig.sendOffer(activeRoomIdRef.current, offer, activeHostTokenRef.current || undefined);
+        }
+      } catch (err) {
+        console.error('[WebRTC] Reconnect negotiation failed:', err);
+        setLastError({ code: 'WEBRTC_ERROR', message: 'Could not reconnect the watch session.' });
+      } finally {
+        negotiationInFlightRef.current = false;
+      }
     });
 
     sig.on('HOST_READY', () => {
@@ -326,12 +367,18 @@ export function useWebRTC(options: UseWebRTCOptions = {}): UseWebRTCReturn {
   }, [initWebRTC]);
 
   const startOfferNegotiation = useCallback(async () => {
-    const webrtc = webrtcRef.current || initWebRTC('host');
-    await webrtc.initialize();
+    if (negotiationInFlightRef.current) return;
+    negotiationInFlightRef.current = true;
+    try {
+      const webrtc = webrtcRef.current || initWebRTC('host');
+      await webrtc.initialize();
 
-    if (roomId && signalingRef.current) {
-      const offer = await webrtc.createOffer();
-      signalingRef.current.sendOffer(roomId, offer, hostToken || undefined);
+      if (roomId && signalingRef.current) {
+        const offer = await webrtc.createOffer();
+        signalingRef.current.sendOffer(roomId, offer, hostToken || undefined);
+      }
+    } finally {
+      negotiationInFlightRef.current = false;
     }
   }, [initWebRTC, roomId, hostToken]);
 
