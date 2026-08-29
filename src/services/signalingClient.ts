@@ -12,7 +12,7 @@ export class SignalingClient {
   private url: string;
   private listeners: Map<SignalingMessageType | 'open' | 'reconnected' | 'close' | 'ws_error', Set<SignalingEventHandler>> = new Map();
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 20;
+  private maxReconnectAttempts = 30;
   private reconnectTimer?: number;
   private isExplicitlyClosed = false;
   private pingTimer?: number;
